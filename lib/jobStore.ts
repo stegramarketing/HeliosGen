@@ -6,7 +6,7 @@ export type JobResult =
   | { status: "done"; imageUrl?: string; imageUrls?: string[]; videoUrl?: string }
   | { status: "error"; error: string };
 
-const FILE = join(process.cwd(), ".job-store.json");
+const FILE = join("/tmp", ".job-store.json");
 
 function read(): Record<string, JobResult> {
   if (!existsSync(FILE)) return {};
