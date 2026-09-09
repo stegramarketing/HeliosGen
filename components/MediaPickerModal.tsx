@@ -85,6 +85,7 @@ export function MediaPickerModal({
   onPickUrl,
   onDeselect,
   onUpload,
+  onUploadFiles,
   anchorRef,
   x,
   y,
@@ -97,6 +98,7 @@ export function MediaPickerModal({
   onPickUrl: (url: string, mediaType: "image" | "video") => void;
   onDeselect?: (url: string) => void;
   onUpload?: () => void;
+  onUploadFiles?: (files: FileList) => void;
   anchorRef?: React.RefObject<HTMLElement | null>;
   x?: number;
   y?: number;
@@ -104,6 +106,10 @@ export function MediaPickerModal({
   maxCount?: number;
 }) {
   const defaultTab: TabId = mediaKind === "image" ? "image-gen" : mediaKind === "video" ? "video-gen" : "uploads";
+  // Files dragged in from the OS — handed straight to the slot the picker was opened for
+  const [fileDropActive, setFileDropActive] = useState(false);
+  const fileDropDepth = useRef(0);
+  const dragHasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
   const [activeTab, setActiveTab] = useState<TabId>(defaultTab);
   const [sourceItems, setSourceItems] = useState<GalleryItem[]>([]);
   const [fetching, setFetching] = useState(false);
@@ -414,7 +420,21 @@ export function MediaPickerModal({
         onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
         style={{ position: "absolute", inset: 0, pointerEvents: "auto" }}
       />
-      <div style={{
+      <div
+        onDragEnter={(e) => { if (!onUploadFiles || !dragHasFiles(e)) return; e.stopPropagation(); fileDropDepth.current++; setFileDropActive(true); }}
+        onDragOver={(e) => { if (!onUploadFiles || !dragHasFiles(e)) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; }}
+        onDragLeave={(e) => { if (!onUploadFiles || !dragHasFiles(e)) return; e.stopPropagation(); fileDropDepth.current = Math.max(0, fileDropDepth.current - 1); if (fileDropDepth.current === 0) setFileDropActive(false); }}
+        onDrop={(e) => {
+          if (!onUploadFiles || !dragHasFiles(e)) return;
+          // Portalled, but React events still bubble to the gallery below — keep
+          // the drop here so it fills this slot instead of the gallery.
+          e.preventDefault();
+          e.stopPropagation();
+          fileDropDepth.current = 0;
+          setFileDropActive(false);
+          if (e.dataTransfer.files.length > 0) onUploadFiles(e.dataTransfer.files);
+        }}
+        style={{
         position: "fixed",
         left: (pos.isAnchored || pos.isCustom) ? pos.left : "50%",
         top: pos.isCustom ? pos.top : (pos.isAnchored ? "auto" : "50%"),
@@ -434,6 +454,22 @@ export function MediaPickerModal({
         pointerEvents: "auto",
         animation: "picker-dropIn 160ms cubic-bezier(0.16,1,0.3,1)",
       }}>
+        {fileDropActive && (
+          <div style={{
+            position: "absolute", inset: 0, zIndex: 5, pointerEvents: "none",
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "8px",
+            background: "rgba(14,16,18,0.86)",
+            border: "2px dashed rgba(45,212,191,0.75)",
+            borderRadius: "18px",
+            color: "#2DD4BF",
+          }}>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span style={{ fontSize: "12px", fontWeight: 500 }}>Drop to upload</span>
+          </div>
+        )}
+
         {/* Tab bar */}
         <div
           onMouseDown={handleDragStart}
