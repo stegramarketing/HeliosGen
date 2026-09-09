@@ -259,6 +259,7 @@ export async function POST(req: NextRequest) {
     imageUrls   = [],
     aspectRatio = "1:1",
     quality     = "1k",
+    transparentBackground = false,
     azureQuality,
     azureResolution,
     azureBaseUrl,
@@ -273,6 +274,7 @@ export async function POST(req: NextRequest) {
     imageUrls?:          string[];
     aspectRatio?:        string;
     quality?:            string;
+    transparentBackground?: boolean; // GPT Image 2.5 — sends background: "transparent"
     azureQuality?:       string;     // "auto" | "low" | "medium" | "high"
     azureResolution?:    string;     // "1k" | "2k" | "4k"
     azureBaseUrl?:       string;     // global base URL from settings
@@ -541,6 +543,7 @@ export async function POST(req: NextRequest) {
         ? (apiInput.qualityMap[quality] ?? quality)
         : quality === "4k" ? "4K" : quality === "2k" ? "2K" : quality === "1k" ? "1K" : quality;
     }
+    if (cfg.supportsTransparency && transparentBackground) input.background = "transparent";
     if (apiInput.extra) Object.assign(input, apiInput.extra);
 
     const requestBody = { model: resolvedApiId, callBackUrl, input };
