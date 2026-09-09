@@ -26,6 +26,11 @@ export interface ImageModel {
   /** Whether this model has a quality / resolution setting */
   supportsQuality: boolean;
   /**
+   * Whether this model can render a transparent background
+   * (GPT Image 2.5 — sends `background: "transparent"` in the API input).
+   */
+  supportsTransparency?: boolean;
+  /**
    * Describes how to map app-level fields to this model's API input object.
    * Add any model-specific static fields under `extra`.
    */
@@ -338,6 +343,49 @@ export const IMAGE_MODELS: ImageModel[] = [
       qualityOptions: ["1k", "2k", "4k"],
       promptMaxLength: 20000,
       extra: { nsfw_checker: false },
+    },
+  },
+  // ── OpenAI GPT Image 2.5 ──────────────────────────────────────────────────────
+  // Two variants of the same model. Flare is the fast default; Sunburst trades
+  // speed for tighter control across repeated edits. Same Kie credit cost as
+  // GPT Image 2. Both support `background: "transparent"` — GPT Image 2 does not.
+  // Kie-only (no azureSizeMap ⇒ no provider picker, see lib/providers.ts).
+  {
+    id: "gpt-image-2-5-flare",
+    apiId: "gpt-image-2-5-flare-image-to-image",
+    textOnlyApiId: "gpt-image-2-5-flare-text-to-image",
+    name: "GPT Image 2.5 Flare",
+    provider: "OpenAI",
+    ratios: ["auto", "1:1", "16:9", "9:16", "4:3", "3:4"],
+    supportsImages: true,
+    maxImages: 16,
+    supportsQuality: true,
+    supportsTransparency: true,
+    apiInput: {
+      aspectRatioKey: "aspect_ratio",
+      imageInputKey: "input_urls",
+      qualityKey: "resolution",
+      qualityOptions: ["1k", "2k", "4k"],
+      promptMaxLength: 20000,
+    },
+  },
+  {
+    id: "gpt-image-2-5-sunburst",
+    apiId: "gpt-image-2-5-sunburst-image-to-image",
+    textOnlyApiId: "gpt-image-2-5-sunburst-text-to-image",
+    name: "GPT Image 2.5 Sunburst",
+    provider: "OpenAI",
+    ratios: ["auto", "1:1", "16:9", "9:16", "4:3", "3:4"],
+    supportsImages: true,
+    maxImages: 16,
+    supportsQuality: true,
+    supportsTransparency: true,
+    apiInput: {
+      aspectRatioKey: "aspect_ratio",
+      imageInputKey: "input_urls",
+      qualityKey: "resolution",
+      qualityOptions: ["1k", "2k", "4k"],
+      promptMaxLength: 20000,
     },
   },
 ];
