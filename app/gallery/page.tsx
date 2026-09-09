@@ -1218,7 +1218,8 @@ function GalleryInner() {
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Files dragged in from the OS (Finder/Explorer)
+  // Files dragged in from the OS (Finder/Explorer), or picked with the Upload button
+  const galleryUploadInputRef = useRef<HTMLInputElement>(null);
   const [fileDropActive, setFileDropActive] = useState(false);
   const [droppedUploads, setDroppedUploads] = useState(0);
   const fileDropDepth = useRef(0);
@@ -3359,6 +3360,39 @@ function GalleryInner() {
               {src === "generated" ? "Generated" : "Uploaded"}
             </button>
           ))}
+
+          {/* Upload — the discoverable half of drag & drop */}
+          <button
+            onClick={() => {
+              if (DEMO_MODE) { setAuthModalOpen(true); return; }
+              galleryUploadInputRef.current?.click();
+            }}
+            title={`Upload ${tab === "videos" ? "videos" : "images"} — or drag them straight onto the gallery`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              marginLeft: "10px",
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px dashed rgba(45,212,191,0.45)",
+              background: "rgba(45,212,191,0.07)",
+              color: "#2DD4BF",
+              fontSize: "13px",
+              fontWeight: 500,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              letterSpacing: "-0.01em",
+              transition: "background 140ms, border-color 140ms",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = "rgba(45,212,191,0.14)"; e.currentTarget.style.borderColor = "rgba(45,212,191,0.7)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "rgba(45,212,191,0.07)"; e.currentTarget.style.borderColor = "rgba(45,212,191,0.45)"; }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            Upload
+          </button>
         </div>
 
         {/* Center: current folder breadcrumb */}
@@ -3659,6 +3693,14 @@ function GalleryInner() {
       )}
 
       {/* ── Hidden file input ── */}
+      <input
+        ref={galleryUploadInputRef}
+        type="file"
+        accept={tab === "videos" ? "video/*" : "image/*"}
+        multiple
+        style={{ display: "none" }}
+        onChange={e => { if (e.target.files?.length) uploadDroppedFiles(e.target.files); e.target.value = ""; }}
+      />
       <input
         ref={fileInputRef}
         type="file"
