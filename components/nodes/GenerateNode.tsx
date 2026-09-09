@@ -27,6 +27,7 @@ const MODEL_CAPS = Object.fromEntries(
   IMAGE_MODELS.map((m) => [m.id, {
     supportsImages: m.supportsImages,
     supportsQuality: m.supportsQuality,
+    supportsTransparency: !!m.supportsTransparency,
     ratios: m.ratios,
     maxImages: m.maxImages,
     qualityOptions: m.apiInput.qualityOptions,
@@ -378,6 +379,7 @@ export default function GenerateNode({ id, data, selected }: NodeProps<GenerateN
   const caps = MODEL_CAPS[model] ?? DEFAULT_CAPS;
   const modelInfo = MODELS.find((m) => m.id === model) ?? MODELS[0];
   const quality = (data.quality as string) ?? "1k";
+  const transparentBackground = (data.transparentBackground as boolean) ?? false;
   const status = data.status ?? "idle";
 
   const [currentProvider, setCurrentProvider] = useState<ProviderId>("kie");
@@ -662,6 +664,7 @@ export default function GenerateNode({ id, data, selected }: NodeProps<GenerateN
       imageUrls: orderedUrls,
       aspectRatio,
       quality,
+      ...(caps.supportsTransparency && transparentBackground ? { transparentBackground: true } : {}),
       ...(isAzure ? {
         azureBaseUrl, azureDeployment, azureQuality, azureResolution,
         ...(aspectRatio === "custom" ? {
@@ -731,7 +734,7 @@ export default function GenerateNode({ id, data, selected }: NodeProps<GenerateN
         setLoading(false);
       }
     }, 3000);
-  }, [id, nodes, edges, model, aspectRatio, quality, data.azureQuality, data.azureCustomWidth, data.azureCustomHeight, debugMode, connectedPromptNodeId, updateNodeData, flashEdgeError, kieKeySet, addToast]);
+  }, [id, nodes, edges, model, aspectRatio, quality, caps.supportsTransparency, transparentBackground, data.azureQuality, data.azureCustomWidth, data.azureCustomHeight, debugMode, connectedPromptNodeId, updateNodeData, flashEdgeError, kieKeySet, addToast]);
 
   const handleGenerateBatch = useCallback(() => {
     generate();
@@ -1114,7 +1117,12 @@ export default function GenerateNode({ id, data, selected }: NodeProps<GenerateN
                           const validQuality = newCaps.qualityOptions && !newCaps.qualityOptions.includes(quality as "1k" | "2k" | "4k")
                             ? newCaps.qualityOptions[0]
                             : quality;
-                          updateNodeData(id, { model: m.id, aspectRatio: validRatio, quality: validQuality });
+                          updateNodeData(id, {
+                            model: m.id,
+                            aspectRatio: validRatio,
+                            quality: validQuality,
+                            ...(newCaps.supportsTransparency ? {} : { transparentBackground: false }),
+                          });
                           if (!newCaps.supportsImages) removeEdgesForHandle(id, "image");
                           setModelOpen(false);
                         }}
@@ -1324,6 +1332,25 @@ export default function GenerateNode({ id, data, selected }: NodeProps<GenerateN
                 </div>
               )}
             </div>
+          )}
+
+          {/* Transparent background pill — GPT Image 2.5 only */}
+          {caps.supportsTransparency && (
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => updateNodeData(id, { transparentBackground: !transparentBackground })}
+              title="Transparent background (PNG)"
+              className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-full hover:brightness-125 transition-all"
+              style={{
+                background: transparentBackground ? "rgba(93,124,255,0.28)" : "rgba(0,0,0,0.45)",
+                backdropFilter: "blur(10px)",
+                WebkitBackdropFilter: "blur(10px)",
+                border: transparentBackground ? "1px solid rgba(93,124,255,0.55)" : "1px solid rgba(255,255,255,0.07)",
+              }}
+            >
+              <CheckerIcon />
+              <span className={`text-[11px] ${transparentBackground ? "text-white" : "text-white/70"}`}>BG</span>
+            </button>
           )}
 
           {/* Azure Quality pill */}
@@ -1545,6 +1572,17 @@ function PhotoIcon() {
       <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
       <circle cx="9" cy="9" r="2" fill="white" stroke="none" />
       <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+    </svg>
+  );
+}
+
+/** Checkerboard mark for the transparent-background toggle. */
+function CheckerIcon() {
+  return (
+    <svg width="9" height="9" viewBox="0 0 8 8" fill="none" className="shrink-0">
+      <rect x="0" y="0" width="4" height="4" fill="currentColor" opacity="0.75" />
+      <rect x="4" y="4" width="4" height="4" fill="currentColor" opacity="0.75" />
+      <rect x="0.5" y="0.5" width="7" height="7" stroke="currentColor" strokeWidth="1" opacity="0.35" />
     </svg>
   );
 }
