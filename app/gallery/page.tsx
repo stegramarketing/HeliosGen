@@ -19,6 +19,8 @@ import { Button } from "@/components/ui/button";
 import { browserNotify, requestNotificationPermission } from "@/lib/browserNotify";
 
 const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
+// Mirrors the cap enforced by /api/upload-asset
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 const DEMO_GALLERY_ITEMS: import("@/lib/galleryUtils").GalleryItem[] = [
   {
@@ -1216,6 +1218,12 @@ function GalleryInner() {
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Files dragged in from the OS (Finder/Explorer), or picked with the Upload button
+  const galleryUploadInputRef = useRef<HTMLInputElement>(null);
+  const [fileDropActive, setFileDropActive] = useState(false);
+  const [droppedUploads, setDroppedUploads] = useState(0);
+  const fileDropDepth = useRef(0);
+
   // Video reference state
   const urlToRef = (url: string): RefImage => ({ id: url, objectUrl: url, cdnUrl: url, uploading: false, error: false });
   const [vidStartFrame, setVidStartFrame] = useState<RefImage | null>(() => { const u = loadSettings(tab, selectedFolderId)?.vidStartFrameUrl; return u ? urlToRef(u) : null; });
@@ -1646,6 +1654,34 @@ function GalleryInner() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceFilter]);
 
+  // Dropping a file on a page navigates to it by default — swallow that across
+  // the gallery route so a near-miss drop doesn't blow the view away. The same
+  // listener clears the overlay after a drop a slot handled (and stopped), and
+  // after a drag the user abandoned.
+  useEffect(() => {
+    const swallow = (e: DragEvent) => {
+      if (!e.dataTransfer?.types.includes("Files")) return;
+      e.preventDefault();
+    };
+    const onDrop = (e: DragEvent) => {
+      swallow(e);
+      fileDropDepth.current = 0;
+      setFileDropActive(false);
+    };
+    const onDragEnd = () => {
+      fileDropDepth.current = 0;
+      setFileDropActive(false);
+    };
+    window.addEventListener("dragover", swallow);
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("dragend", onDragEnd);
+    return () => {
+      window.removeEventListener("dragover", swallow);
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("dragend", onDragEnd);
+    };
+  }, []);
+
   // Persist settings
   useEffect(() => {
     const refImageUrls = [...new Set(refImages
@@ -2024,6 +2060,94 @@ function GalleryInner() {
     }
   };
 
+  // ── Drag & drop upload from the OS ────────────────────────────────────────
+
+  const fetchUploadedPage = async (currentTab: Tab, token: string): Promise<GalleryItem[]> => {
+    try {
+      const genType = currentTab === "videos" ? "video" : "image";
+      const res = await fetch(`/api/gallery?type=${genType}&page=0&source=upload`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return [];
+      const { items } = await res.json() as { items: GalleryItem[] };
+      return items;
+    } catch {
+      return [];
+    }
+  };
+
+  // Files dropped on the gallery go to R2 via /api/upload-asset, which also
+  // records them in user_uploads — so they surface under the "Uploaded" source.
+  // With a folder open they are filed into that folder as well.
+  const uploadDroppedFiles = async (fileList: FileList) => {
+    if (DEMO_MODE) { setAuthModalOpen(true); return; }
+    const currentTab = tabRef.current;
+    const isVideoTab = currentTab === "videos";
+    const prefix = isVideoTab ? "video/" : "image/";
+    const all = Array.from(fileList);
+    const files = all.filter(f => f.type.startsWith(prefix) && f.size <= MAX_UPLOAD_BYTES);
+    const rejected = all.length - files.length;
+    if (rejected > 0) {
+      addToast(`${rejected} file${rejected > 1 ? "s" : ""} skipped — this tab takes ${isVideoTab ? "videos" : "images"} up to 100 MB.`, "info");
+    }
+    if (files.length === 0) return;
+
+    const token = await getToken();
+    if (!token) { setAuthModalOpen(true); return; }
+
+    setDroppedUploads(n => n + files.length);
+    const uploadedUrls: string[] = [];
+    let failed = 0;
+    await Promise.all(files.map(async file => {
+      try {
+        const res = await fetch("/api/upload-asset", {
+          method: "POST",
+          headers: { "Content-Type": file.type, Authorization: `Bearer ${token}` },
+          body: file,
+        });
+        const data = await res.json() as { cdnUrl?: string; error?: string };
+        if (!res.ok || !data.cdnUrl) throw new Error(data.error ?? "Upload failed");
+        uploadedUrls.push(data.cdnUrl);
+      } catch {
+        failed++;
+      } finally {
+        setDroppedUploads(n => Math.max(0, n - 1));
+      }
+    }));
+
+    if (failed > 0) addToast(`${failed} upload${failed > 1 ? "s" : ""} failed.`, "error");
+    if (uploadedUrls.length === 0) return;
+
+    // Uploads live under the "Uploaded" source — switch there so the dropped
+    // files are actually visible.
+    if (sourceFilterRef.current !== "uploaded") {
+      sourceFilterRef.current = "uploaded";
+      setSourceFilter("uploaded");
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("source", "uploaded");
+      router.replace(`${pathname}?${params.toString()}`);
+    }
+
+    // The user_uploads row is written fire-and-forget by the API, so page 0 can
+    // lag a beat behind the response — poll briefly for the new ids.
+    const wanted = new Set(uploadedUrls);
+    let newIds: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const fresh = await fetchUploadedPage(currentTab, token);
+      newIds = fresh.filter(i => wanted.has(i.url)).map(i => i.id);
+      if (newIds.length >= wanted.size) break;
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    const folderId = useFolderStore.getState().selectedFolderId;
+    if (folderId && newIds.length > 0) {
+      await useFolderStore.getState().assignItemsToFolder(newIds, folderId);
+    }
+
+    await loadItems(currentTab, 0, true);
+    addToast(`${uploadedUrls.length} file${uploadedUrls.length > 1 ? "s" : ""} uploaded.`, "success");
+  };
+
   const handlePickerUpload = () => {
     setPickerOpen(false);
     if (DEMO_MODE) { useWorkflowStore.getState().setAuthModalOpen(true); return; }
@@ -2034,6 +2158,14 @@ function GalleryInner() {
       if (pickerUploadKind === "image") vidImgInputRef.current?.click();
       else vidVideoInputRef.current?.click();
     }
+  };
+
+  const handlePickerDropFiles = (files: FileList) => {
+    const target = pickerTarget;
+    setPickerOpen(false);
+    if (DEMO_MODE) { setAuthModalOpen(true); return; }
+    if (target === "refImage") handleFilePick(files);
+    else if (target) handleVidFilePick(files, target);
   };
 
   // ── Generate ──────────────────────────────────────────────────────────────
@@ -2665,6 +2797,29 @@ function GalleryInner() {
     }
   }, [handleAddReference, modelId]);
 
+  // Reference slots accept both in-app gallery items and files from the OS.
+  const dragHasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
+  const dragHasGalleryItem = (e: React.DragEvent) => e.dataTransfer.types.includes("application/x-gallery-item");
+
+  const handleSlotDrop = (
+    e: React.DragEvent,
+    target: "refImage" | "startFrame" | "endFrame" | "resource" | "videoRef" | "referenceVideo" | "audioRef",
+    expectedKind: "image" | "video" | "audio",
+  ) => {
+    if (dragHasFiles(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOverSlotKey(null);
+      const files = e.dataTransfer.files;
+      if (files.length === 0) return;
+      if (target === "refImage") handleFilePick(files);
+      else handleVidFilePick(files, target);
+      return;
+    }
+    if (expectedKind === "audio" || target === "audioRef") return;
+    handleGalleryItemDrop(e, target, expectedKind);
+  };
+
   const handleReorderDrop = (targetId: string, listTarget: "refImage" | "resource" | "referenceVideo" | "audioRef") => {
     const dragId = _reorderDragItem?.id;
     _reorderDragItem = null;
@@ -3082,9 +3237,73 @@ function GalleryInner() {
   if (!authLoaded) return <div style={{ flex: 1, background: "#0B0E14" }} />;
 
 
+  const dropFolderName = selectedFolderId ? folders.find(f => f.id === selectedFolderId)?.name ?? null : null;
+
   return (
-    <div style={{ flex: 1, background: "#0B0E14", display: "flex", flexDirection: "column", overflow: "hidden", color: "#fff", position: "relative" }}>
+    <div
+      style={{ flex: 1, background: "#0B0E14", display: "flex", flexDirection: "column", overflow: "hidden", color: "#fff", position: "relative" }}
+      onDragEnter={e => {
+        if (!dragHasFiles(e) || (!user && !DEMO_MODE)) return;
+        fileDropDepth.current++;
+        setFileDropActive(true);
+      }}
+      onDragOver={e => {
+        if (!dragHasFiles(e) || (!user && !DEMO_MODE)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }}
+      onDragLeave={e => {
+        if (!dragHasFiles(e) || (!user && !DEMO_MODE)) return;
+        fileDropDepth.current = Math.max(0, fileDropDepth.current - 1);
+        if (fileDropDepth.current === 0) setFileDropActive(false);
+      }}
+      onDrop={e => {
+        if (!dragHasFiles(e) || (!user && !DEMO_MODE)) return;
+        e.preventDefault();
+        fileDropDepth.current = 0;
+        setFileDropActive(false);
+        const files = e.dataTransfer.files;
+        if (files.length > 0) uploadDroppedFiles(files);
+      }}
+    >
       <DotCanvasBackground />
+
+      {/* ── Drop-to-upload overlay ── */}
+      {(fileDropActive || droppedUploads > 0) && (
+        <div style={{
+          position: "absolute",
+          inset: "6px",
+          zIndex: 60,
+          pointerEvents: "none",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "10px",
+          flexDirection: "column",
+          background: "rgba(11,14,20,0.74)",
+          border: "2px dashed rgba(45,212,191,0.75)",
+          borderRadius: "12px",
+          color: "#2DD4BF",
+        }}>
+          {droppedUploads > 0 ? (
+            <>
+              <span style={{ width: "22px", height: "22px", borderRadius: "50%", border: "2px solid rgba(45,212,191,0.25)", borderTopColor: "#2DD4BF", display: "inline-block", animation: "spin 0.75s linear infinite" }} />
+              <span style={{ fontSize: "13px", fontWeight: 500 }}>
+                Uploading {droppedUploads} file{droppedUploads > 1 ? "s" : ""}…
+              </span>
+            </>
+          ) : (
+            <>
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              <span style={{ fontSize: "13px", fontWeight: 500 }}>
+                Drop {tab === "videos" ? "videos" : "images"} to upload{dropFolderName ? ` to ${dropFolderName}` : ""}
+              </span>
+            </>
+          )}
+        </div>
+      )}
 
       {/* ── Sub-navbar ── */}
       {user && <div style={{
@@ -3141,6 +3360,39 @@ function GalleryInner() {
               {src === "generated" ? "Generated" : "Uploaded"}
             </button>
           ))}
+
+          {/* Upload — the discoverable half of drag & drop */}
+          <button
+            onClick={() => {
+              if (DEMO_MODE) { setAuthModalOpen(true); return; }
+              galleryUploadInputRef.current?.click();
+            }}
+            title={`Upload ${tab === "videos" ? "videos" : "images"} — or drag them straight onto the gallery`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              marginLeft: "10px",
+              padding: "5px 12px",
+              borderRadius: "8px",
+              border: "1px dashed rgba(45,212,191,0.45)",
+              background: "rgba(45,212,191,0.07)",
+              color: "#2DD4BF",
+              fontSize: "13px",
+              fontWeight: 500,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              letterSpacing: "-0.01em",
+              transition: "background 140ms, border-color 140ms",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = "rgba(45,212,191,0.14)"; e.currentTarget.style.borderColor = "rgba(45,212,191,0.7)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "rgba(45,212,191,0.07)"; e.currentTarget.style.borderColor = "rgba(45,212,191,0.45)"; }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            Upload
+          </button>
         </div>
 
         {/* Center: current folder breadcrumb */}
@@ -3441,6 +3693,14 @@ function GalleryInner() {
       )}
 
       {/* ── Hidden file input ── */}
+      <input
+        ref={galleryUploadInputRef}
+        type="file"
+        accept={tab === "videos" ? "video/*" : "image/*"}
+        multiple
+        style={{ display: "none" }}
+        onChange={e => { if (e.target.files?.length) uploadDroppedFiles(e.target.files); e.target.value = ""; }}
+      />
       <input
         ref={fileInputRef}
         type="file"
@@ -3832,7 +4092,7 @@ function GalleryInner() {
                   const isHovered = hoveredRefId === img.id;
                   const isDragging = draggingId === img.id;
                   return (
-                    <div key={img.id} onMouseDown={e => e.preventDefault()} onPointerDown={e => { if (refImages.length <= 1 || img.uploading || img.error) return; _reorderDragItem = { id: img.id, listTarget: "refImage" }; _reorderOverId = null; setDraggingId(img.id); }} onPointerEnter={() => { if (!_reorderDragItem || _reorderDragItem.id === img.id || _reorderDragItem.listTarget !== "refImage") return; _reorderOverId = img.id; setReorderOverId(img.id); }} onPointerUp={e => { const info = _reorderDragItem; if (!info || info.listTarget !== "refImage") return; e.stopPropagation(); if (_reorderOverId) e.preventDefault(); const target = _reorderOverId ?? img.id; handleReorderDrop(target, "refImage"); }} onMouseEnter={() => { if (!draggingId) setHoveredRefId(img.id); }} onMouseLeave={() => setHoveredRefId(null)} onClick={() => { if (_reorderJustDropped) { _reorderJustDropped = false; return; } if (!img.uploading && !img.error && !draggingId) setRefPreview({ url: img.objectUrl, mediaKind: "image" }); }} onDragOver={e => { if (!e.dataTransfer.types.includes("application/x-gallery-item")) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(`refimg-filled-${img.id}`); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => handleGalleryItemDrop(e, "refImage", "image")} style={{ position: "relative", width: "64px", height: "64px", borderRadius: "8px", overflow: "hidden", background: "#1A1C1F", flexShrink: 0, touchAction: refImages.length > 1 ? "none" : undefined, transition: "border 120ms, box-shadow 120ms, opacity 120ms", border: img.error ? "1px solid rgba(248,113,113,0.4)" : dragOverSlotKey === `refimg-filled-${img.id}` ? "2.5px solid #2DD4BF" : taggedImages.some(t => t.refId === img.id) ? "2.5px solid #10b981" : "1px solid rgba(255,255,255,0.08)", boxShadow: dragOverSlotKey === `refimg-filled-${img.id}` ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, cursor: (!img.uploading && !img.error) ? (refImages.length > 1 ? (draggingId === img.id ? "grabbing" : "grab") : "zoom-in") : "default", animation: isRemoving ? "none" : (isDragging ? "none" : "refImgIn 260ms cubic-bezier(0.16,1,0.3,1) backwards"), opacity: isDragging ? 0.3 : undefined, ...(isRemoving ? { transition: "opacity 170ms, transform 170ms", opacity: 0, transform: "translateY(-10px) scale(0.92)" } : {}) }}>
+                    <div key={img.id} onMouseDown={e => e.preventDefault()} onPointerDown={e => { if (refImages.length <= 1 || img.uploading || img.error) return; _reorderDragItem = { id: img.id, listTarget: "refImage" }; _reorderOverId = null; setDraggingId(img.id); }} onPointerEnter={() => { if (!_reorderDragItem || _reorderDragItem.id === img.id || _reorderDragItem.listTarget !== "refImage") return; _reorderOverId = img.id; setReorderOverId(img.id); }} onPointerUp={e => { const info = _reorderDragItem; if (!info || info.listTarget !== "refImage") return; e.stopPropagation(); if (_reorderOverId) e.preventDefault(); const target = _reorderOverId ?? img.id; handleReorderDrop(target, "refImage"); }} onMouseEnter={() => { if (!draggingId) setHoveredRefId(img.id); }} onMouseLeave={() => setHoveredRefId(null)} onClick={() => { if (_reorderJustDropped) { _reorderJustDropped = false; return; } if (!img.uploading && !img.error && !draggingId) setRefPreview({ url: img.objectUrl, mediaKind: "image" }); }} onDragOver={e => { if (!dragHasGalleryItem(e) && !dragHasFiles(e)) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(`refimg-filled-${img.id}`); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => handleSlotDrop(e, "refImage", "image")} style={{ position: "relative", width: "64px", height: "64px", borderRadius: "8px", overflow: "hidden", background: "#1A1C1F", flexShrink: 0, touchAction: refImages.length > 1 ? "none" : undefined, transition: "border 120ms, box-shadow 120ms, opacity 120ms", border: img.error ? "1px solid rgba(248,113,113,0.4)" : dragOverSlotKey === `refimg-filled-${img.id}` ? "2.5px solid #2DD4BF" : taggedImages.some(t => t.refId === img.id) ? "2.5px solid #10b981" : "1px solid rgba(255,255,255,0.08)", boxShadow: dragOverSlotKey === `refimg-filled-${img.id}` ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, cursor: (!img.uploading && !img.error) ? (refImages.length > 1 ? (draggingId === img.id ? "grabbing" : "grab") : "zoom-in") : "default", animation: isRemoving ? "none" : (isDragging ? "none" : "refImgIn 260ms cubic-bezier(0.16,1,0.3,1) backwards"), opacity: isDragging ? 0.3 : undefined, ...(isRemoving ? { transition: "opacity 170ms, transform 170ms", opacity: 0, transform: "translateY(-10px) scale(0.92)" } : {}) }}>
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img src={thumbSrc(img.objectUrl, snapWidth(64))} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
                       {isHovered && !img.uploading && !img.error && (
@@ -3850,9 +4110,9 @@ function GalleryInner() {
                   <button
                     onClick={() => openPicker("refImage", "image")}
                     disabled={submitting}
-                    onDragOver={e => { if (!e.dataTransfer.types.includes("application/x-gallery-item")) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey("refImage-add"); }}
+                    onDragOver={e => { if (!dragHasGalleryItem(e) && !dragHasFiles(e)) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey("refImage-add"); }}
                     onDragLeave={() => setDragOverSlotKey(null)}
-                    onDrop={e => handleGalleryItemDrop(e, "refImage", "image")}
+                    onDrop={e => handleSlotDrop(e, "refImage", "image")}
                     style={{ width: "64px", height: "64px", borderRadius: "8px", border: dragOverSlotKey === "refImage-add" ? "2.5px solid #2DD4BF" : "1.5px dashed rgba(255,255,255,0.2)", boxShadow: dragOverSlotKey === "refImage-add" ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, background: dragOverSlotKey === "refImage-add" ? "rgba(45,212,191,0.07)" : "rgba(255,255,255,0.03)", cursor: submitting ? "not-allowed" : "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "4px", color: dragOverSlotKey === "refImage-add" ? "#2DD4BF" : "rgba(255,255,255,0.45)", flexShrink: 0, transition: "all 140ms" }}>
                     <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.04em" }}>IMAGE</span>
                     <span style={{ fontSize: "8px", color: dragOverSlotKey === "refImage-add" ? "#2DD4BF" : "rgba(255,255,255,0.3)" }}>
@@ -3949,7 +4209,7 @@ function GalleryInner() {
                         const listForSlot = slot.target === "resource" ? vidResources : slot.target === "referenceVideo" ? vidRefVideos : vidRefAudios;
                         const isSlotDragging = draggingId === r.id;
                         return (
-                        <div key={r.id} onMouseDown={e => e.preventDefault()} onPointerDown={e => { if (!isMultiTarget || listForSlot.length <= 1 || r.uploading || r.error) return; _reorderDragItem = { id: r.id, listTarget: slot.target as "resource"|"referenceVideo"|"audioRef" }; _reorderOverId = null; setDraggingId(r.id); }} onPointerEnter={() => { if (!_reorderDragItem || _reorderDragItem.id === r.id || _reorderDragItem.listTarget !== slot.target) return; _reorderOverId = r.id; setReorderOverId(r.id); }} onPointerUp={e => { const info = _reorderDragItem; if (!info || info.listTarget !== slot.target) return; e.stopPropagation(); if (_reorderOverId) e.preventDefault(); const target = _reorderOverId ?? r.id; handleReorderDrop(target, slot.target as "resource"|"referenceVideo"|"audioRef"); }} onMouseEnter={() => { if (!draggingId) setHoveredRefId(hovId); }} onMouseLeave={() => setHoveredRefId(null)} onDragOver={e => { if (slot.mediaKind === "audio" || !e.dataTransfer.types.includes("application/x-gallery-item")) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(dragKey); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => { if (slot.mediaKind !== "audio") handleGalleryItemDrop(e, slot.target as any, slot.mediaKind as "image" | "video"); }} style={{ position: "relative", width: "64px", height: "64px", borderRadius: "8px", overflow: "hidden", flexShrink: 0, background: "#1a1c1f", touchAction: (isMultiTarget && listForSlot.length > 1) ? "none" : undefined, transition: "border 120ms, box-shadow 120ms, opacity 120ms", border: r.error ? "1px solid rgba(248,113,113,0.4)" : dragOverSlotKey === dragKey ? "2.5px solid #2DD4BF" : taggedImages.some(t => t.refId === r.id) ? "2.5px solid #10b981" : "1px solid rgba(255,255,255,0.12)", boxShadow: dragOverSlotKey === dragKey ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, opacity: isSlotDragging ? 0.3 : undefined, cursor: (isMultiTarget && listForSlot.length > 1 && !r.uploading && !r.error) ? (draggingId === r.id ? "grabbing" : "grab") : undefined }}>
+                        <div key={r.id} onMouseDown={e => e.preventDefault()} onPointerDown={e => { if (!isMultiTarget || listForSlot.length <= 1 || r.uploading || r.error) return; _reorderDragItem = { id: r.id, listTarget: slot.target as "resource"|"referenceVideo"|"audioRef" }; _reorderOverId = null; setDraggingId(r.id); }} onPointerEnter={() => { if (!_reorderDragItem || _reorderDragItem.id === r.id || _reorderDragItem.listTarget !== slot.target) return; _reorderOverId = r.id; setReorderOverId(r.id); }} onPointerUp={e => { const info = _reorderDragItem; if (!info || info.listTarget !== slot.target) return; e.stopPropagation(); if (_reorderOverId) e.preventDefault(); const target = _reorderOverId ?? r.id; handleReorderDrop(target, slot.target as "resource"|"referenceVideo"|"audioRef"); }} onMouseEnter={() => { if (!draggingId) setHoveredRefId(hovId); }} onMouseLeave={() => setHoveredRefId(null)} onDragOver={e => { if (!dragHasFiles(e) && (slot.mediaKind === "audio" || !dragHasGalleryItem(e))) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(dragKey); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => handleSlotDrop(e, slot.target as any, slot.mediaKind as "image" | "video" | "audio")} style={{ position: "relative", width: "64px", height: "64px", borderRadius: "8px", overflow: "hidden", flexShrink: 0, background: "#1a1c1f", touchAction: (isMultiTarget && listForSlot.length > 1) ? "none" : undefined, transition: "border 120ms, box-shadow 120ms, opacity 120ms", border: r.error ? "1px solid rgba(248,113,113,0.4)" : dragOverSlotKey === dragKey ? "2.5px solid #2DD4BF" : taggedImages.some(t => t.refId === r.id) ? "2.5px solid #10b981" : "1px solid rgba(255,255,255,0.12)", boxShadow: dragOverSlotKey === dragKey ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, opacity: isSlotDragging ? 0.3 : undefined, cursor: (isMultiTarget && listForSlot.length > 1 && !r.uploading && !r.error) ? (draggingId === r.id ? "grabbing" : "grab") : undefined }}>
                           {slot.mediaKind === "image" ? <img src={thumbSrc(r.objectUrl, snapWidth(64))} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} /> : slot.mediaKind === "video" ? <video src={r.objectUrl} autoPlay muted loop playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} /> : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(255,255,255,0.04)" }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>}
                           {hoveredRefId === hovId && !r.uploading && !r.error && slot.mediaKind !== "audio" && (
                             <div onClick={() => { if (_reorderJustDropped || draggingId) { _reorderJustDropped = false; return; } setRefPreview({ url: r.objectUrl, mediaKind: slot.mediaKind }); }} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.35)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-in", zIndex: 1 }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></div>
@@ -3961,7 +4221,7 @@ function GalleryInner() {
                         }
                         const vidAddKey = `vidadd-${slot.target}-${idx}`;
                         return (
-                        <button key={`${slot.target}-add-${idx}`} onClick={() => slot.mediaKind === "audio" ? (vidPickTarget.current = slot.target, vidAudioInputRef.current?.click()) : openPicker(slot.target as any, slot.mediaKind)} disabled={submitting} onDragOver={e => { if (slot.mediaKind === "audio" || !e.dataTransfer.types.includes("application/x-gallery-item")) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(vidAddKey); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => { if (slot.mediaKind !== "audio") handleGalleryItemDrop(e, slot.target as any, slot.mediaKind as "image" | "video"); }} style={{ width: "64px", height: "64px", borderRadius: "8px", flexShrink: 0, border: dragOverSlotKey === vidAddKey ? "2.5px solid #2DD4BF" : "1.5px dashed rgba(255,255,255,0.2)", boxShadow: dragOverSlotKey === vidAddKey ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, background: dragOverSlotKey === vidAddKey ? "rgba(45,212,191,0.07)" : "rgba(255,255,255,0.03)", cursor: submitting ? "not-allowed" : "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px", color: dragOverSlotKey === vidAddKey ? "#2DD4BF" : "rgba(255,255,255,0.4)", transition: "all 140ms" }}>
+                        <button key={`${slot.target}-add-${idx}`} onClick={() => slot.mediaKind === "audio" ? (vidPickTarget.current = slot.target, vidAudioInputRef.current?.click()) : openPicker(slot.target as any, slot.mediaKind)} disabled={submitting} onDragOver={e => { if (!dragHasFiles(e) && (slot.mediaKind === "audio" || !dragHasGalleryItem(e))) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; setDragOverSlotKey(vidAddKey); }} onDragLeave={() => setDragOverSlotKey(null)} onDrop={e => handleSlotDrop(e, slot.target as any, slot.mediaKind as "image" | "video" | "audio")} style={{ width: "64px", height: "64px", borderRadius: "8px", flexShrink: 0, border: dragOverSlotKey === vidAddKey ? "2.5px solid #2DD4BF" : "1.5px dashed rgba(255,255,255,0.2)", boxShadow: dragOverSlotKey === vidAddKey ? "0 0 0 3px rgba(45,212,191,0.25)" : undefined, background: dragOverSlotKey === vidAddKey ? "rgba(45,212,191,0.07)" : "rgba(255,255,255,0.03)", cursor: submitting ? "not-allowed" : "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px", color: dragOverSlotKey === vidAddKey ? "#2DD4BF" : "rgba(255,255,255,0.4)", transition: "all 140ms" }}>
                         <span style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.04em" }}>{slot.label === "Ref Video" ? "VIDEO" : slot.label === "Audio" ? "AUDIO" : slot.label.toUpperCase()}</span>
                         <span style={{ fontSize: "8px", color: dragOverSlotKey === vidAddKey ? "#2DD4BF" : "rgba(255,255,255,0.3)" }}>{slot.countLeft} left</span>
                         </button>
@@ -5075,6 +5335,7 @@ function GalleryInner() {
         onPickUrl={handlePickerSelect}
         onDeselect={handlePickerDeselect}
         onUpload={handlePickerUpload}
+        onUploadFiles={handlePickerDropFiles}
         anchorRef={promptBarRef}
         selectedUrls={
           pickerTarget === "refImage" ? refImages.filter(r => r.cdnUrl).map(r => r.cdnUrl!) :
